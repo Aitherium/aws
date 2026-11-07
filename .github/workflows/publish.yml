@@ -77,13 +77,13 @@ jobs:
         if: steps.sel.outputs.go == '1'
         run: |
           if [ "${{ matrix.slim }}" = "true" ]; then
-            sudo -E sh aws-public-slim.sh "$SRC" "$DST"
+            sudo EXCLUDE_RE="$EXCLUDE_RE" sh aws-public-slim.sh "$SRC" "$DST"
           else
             sudo podman pull -q "$SRC" && sudo podman tag "$SRC" "$DST"
           fi
       - name: Scan every layer before any push
         if: steps.sel.outputs.go == '1'
-        run: sudo -E python3 scan_layers.py "$DST"
+        run: sudo EXCLUDE_RE="$EXCLUDE_RE" python3 scan_layers.py "$DST"
       - name: Push (as this repo, so the package is created public)
         if: steps.sel.outputs.go == '1'
         run: |
