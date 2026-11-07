@@ -1,0 +1,65 @@
+# Prometheus scrape config for AitherOS Sovereign deployments
+# Auto-generated targets for all sovereign services
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "sovereign-adk"
+    static_configs:
+      - targets: ["adk-server:8080"]
+    metrics_path: /health
+
+  - job_name: "sovereign-workspace"
+    static_configs:
+      - targets: ["workspace-app:8000"]
+    metrics_path: /api/health
+
+  - job_name: "sovereign-identity"
+    static_configs:
+      - targets: ["identity:8100"]
+    metrics_path: /health
+
+  - job_name: "sovereign-secrets"
+    static_configs:
+      - targets: ["secrets:8111"]
+    metrics_path: /health
+
+  - job_name: "sovereign-directory"
+    static_configs:
+      - targets: ["directory:8108"]
+    metrics_path: /health
+
+  - job_name: "sovereign-spirit"
+    static_configs:
+      - targets: ["spirit:8087"]
+    metrics_path: /health
+
+  - job_name: "sovereign-graph"
+    static_configs:
+      - targets: ["graph:8135"]
+    metrics_path: /health
+
+  - job_name: "sovereign-microscheduler"
+    static_configs:
+      - targets: ["microscheduler:8150"]
+    metrics_path: /health
+
+  - job_name: "sovereign-ollama"
+    static_configs:
+      - targets: ["ollama:11434"]
+    metrics_path: /api/tags
+
+  - job_name: "sovereign-qdrant"
+    static_configs:
+      - targets: ["qdrant:6333"]
+    metrics_path: /healthz
+
+  - job_name: "sovereign-redis"
+    static_configs:
+      - targets: ["redis:6379"]
+    # Redis doesn't have HTTP metrics; this is a placeholder.
+    # Use redis_exporter if you need Redis metrics.
+    scrape_interval: 30s
+    metrics_path: /metrics

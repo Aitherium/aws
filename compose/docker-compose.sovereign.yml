@@ -1,0 +1,943 @@
+# =============================================================================
+# Sovereign Self-Hosted Deployment — Complete AitherOS Stack
+# =============================================================================
+#
+# Everything a customer needs to run AitherOS on their own hardware with
+# zero dependency on Aitherium cloud. The customer owns the auth plane (their
+# own OIDC/OAuth/SAML issuer: SecurityCore/Identity + Directory + Secrets) and
+# their own data (Strata + Postgres + Redis). Nothing phones home: federation,
+# the mothership and the `sync` profile are OFF unless explicitly configured.
+#
+# Self-hosted auth (the issuer is derived from ONE required variable):
+#   AITHER_SOVEREIGN_DOMAIN=acme.example
+#     issuer      https://idp.acme.example/identity   (OIDC discovery lives here)
+#     portal      https://acme.example                (redirect URIs, magic links)
+#   Point idp.<domain> at the `identity` service (port ${IDENTITY_PORT:-8115}) behind
+#   your own TLS terminator. Built-in OIDC clients are registered ONLY when their
+#   secret is set (OIDC_PORTAL_CLIENT_SECRET, OIDC_VEIL_CLIENT_SECRET,
+#   OIDC_GRAFANA_CLIENT_SECRET, OIDC_DEVICE_LINK_CLIENT_SECRET); a missing or
+#   repository-published secret refuses the client instead of guessing one.
+#
+# Usage:
+#   # Basic (ADK + Ollama + workspace + memory):
+#   docker compose -f docker-compose.sovereign.yml up -d
+#
+#   # With GPU-accelerated vLLM:
+#   docker compose -f docker-compose.sovereign.yml --profile gpu up -d
+#
+#   # Full stack with all profiles:
+#   docker compose -f docker-compose.sovereign.yml --profile gpu --profile sync up -d
+#
+# Environment variables (set in .env or export):
+#   AITHER_API_KEY        — Aitherium API key (for image pulls + sync)
+#   AITHER_TENANT         — Tenant slug (default: default)
+#   AITHER_IDENTITY       — Primary agent identity (default: aither)
+#   AITHER_ADMIN_EMAIL    — Admin email for onboarding
+#   AITHER_ADMIN_PASSWORD — Admin password (auto-generated if empty)
+#   AITHER_SOVEREIGN_DOMAIN — REQUIRED. Your public domain; the IdP issuer and every
+#                           public URL the auth plane names derive from it
+#   AITHER_MASTER_KEY     — REQUIRED. Vault master key (openssl rand -hex 32)
+#   AITHER_KEY_SALT       — REQUIRED. Tenant-key HKDF salt (openssl rand -hex 32)
+#   POSTGRES_PASSWORD     — REQUIRED. Directory/Identity session store password
+#   AITHER_FEDERATION_HUB_URL — OPTIONAL. Unset = no federation (the default)
+#   AITHER_PLATFORM_URL   — OPTIONAL. Only read by the opt-in `sync` profile
+#
+# =============================================================================
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  environment: &common-env
+    AITHER_STANDALONE: "true"
+    AITHER_DEPLOYMENT_MODE: "sovereign"
+    AITHER_DOCKER_MODE: "true"
+    AITHER_TENANT: ${AITHER_TENANT:-default}
+    # Mothership/federation OFF: nothing below names an aitherium.com host.
+    AITHER_PHONEHOME_ENABLED: "false"
+    AITHER_FEDERATION_HUB_URL: ${AITHER_FEDERATION_HUB_URL:-}
+
+# The customer's auth plane: every public URL Identity names derives from ONE
+# required variable. check_sovereign_replica.py SOV006/SOV007 assert that no
+# service here (outside opt-in profiles) names *.aitherium.com, and that every
+# aitherium.com CODE default in the services this stack runs is overridden here.
+x-sovereign-idp-env: &sovereign-idp-env
+  AITHER_SOVEREIGN_DOMAIN: ${AITHER_SOVEREIGN_DOMAIN:?AITHER_SOVEREIGN_DOMAIN must be set to your public domain (e.g. acme.example)}
+  AITHER_IDP_BASE_URL: https://idp.${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_IDENTITY_ROUTE_PREFIX: /identity
+  AITHER_OIDC_ISSUER: https://idp.${AITHER_SOVEREIGN_DOMAIN}/identity
+  AITHER_DEVICE_VERIFICATION_URL: https://idp.${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_PORTAL_LOGIN_URL: https://idp.${AITHER_SOVEREIGN_DOMAIN}/identity/oidc/login
+  AUTH_IDP_RETURN_ORIGIN: https://idp.${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_PUBLIC_BASE_DOMAIN: ${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_MAIL_DOMAIN: ${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_PORTAL_URL: https://${AITHER_SOVEREIGN_DOMAIN}
+  AITHERPORTAL_PUBLIC_URL: https://${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_FRONTEND_URL: https://${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_VEIL_URL: https://${AITHER_SOVEREIGN_DOMAIN}
+  AITHER_UPGRADE_URL: https://${AITHER_SOVEREIGN_DOMAIN}/settings/billing
+  AITHER_AUTHMD_RESOURCE: https://${AITHER_SOVEREIGN_DOMAIN}/
+  AITHER_AUTHMD_LOGO_URI: https://${AITHER_SOVEREIGN_DOMAIN}/logo.png
+  AITHER_OIDC_SELF_SERVICE_DOMAINS: .${AITHER_SOVEREIGN_DOMAIN}
+  # RFC 8707 resource targets Identity mints resource-bound tokens for. The code
+  # default names mcp.aitherium.com (#10642); a customer IdP binds its OWN MCP host.
+  AITHER_OIDC_ALLOWED_RESOURCES: ${AITHER_OIDC_ALLOWED_RESOURCES:-https://mcp.${AITHER_SOVEREIGN_DOMAIN},https://mcp.${AITHER_SOVEREIGN_DOMAIN}/mcp,https://mcp.${AITHER_SOVEREIGN_DOMAIN}/connector}
+  # A customer IdP never trusts the Aitherium GitHub org; name your own to seed it.
+  AITHER_GITHUB_SAML_ORG: ${AITHER_GITHUB_SAML_ORG:-}
+  AITHER_TUNNEL_PUBLIC_URL: ${AITHER_TUNNEL_PUBLIC_URL:-}
+  # Built-in OIDC client secrets. Empty = the client is NOT registered (fail closed).
+  OIDC_PORTAL_CLIENT_SECRET: ${OIDC_PORTAL_CLIENT_SECRET:-}
+  OIDC_VEIL_CLIENT_SECRET: ${OIDC_VEIL_CLIENT_SECRET:-}
+  OIDC_GRAFANA_CLIENT_SECRET: ${OIDC_GRAFANA_CLIENT_SECRET:-}
+  OIDC_DEVICE_LINK_CLIENT_SECRET: ${OIDC_DEVICE_LINK_CLIENT_SECRET:-}
+
+# Postgres + Redis the auth/data plane shares (Directory `dual` backend, auth state).
+x-sovereign-data-env: &sovereign-data-env
+  POSTGRES_HOST: aitheros-postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: aither
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+  POSTGRES_DB: aither_admin
+  POSTGRES_ADMIN_DB: aither_admin
+  REDIS_URL: redis://redis:6379
+  AITHER_DIRECTORY_BACKEND: dual
+  AITHER_SERVICE_HOST_PREFIX: "aitheros-"
+  AITHER_MASTER_KEY: ${AITHER_MASTER_KEY:?AITHER_MASTER_KEY must be set}
+
+services:
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  ADK SERVER — Agent brain (ReAct loop, tools, fleet, forge)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  adk-server:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/adk-server:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-adk
+    <<: *common
+    ports:
+      - "${ADK_PORT:-8080}:8080"
+    environment:
+      <<: *common-env
+      AITHER_IDENTITY: ${AITHER_IDENTITY:-aither}
+      OLLAMA_HOST: http://ollama:11434
+      VLLM_URL: ${VLLM_URL:-}
+      AITHER_SPIRIT_URL: http://spirit:8087
+      AITHER_LLM_BACKEND: ${AITHER_LLM_BACKEND:-ollama}
+      AITHER_MODEL: ${AITHER_MODEL:-}
+      MICROSCHEDULER_URL: http://microscheduler:8150
+      ADK_BUILTIN_TOOLS: "true"
+      ADK_SAFETY: "true"
+      # App-specific proxy tool base URL (set by deploy sovereign --app)
+      ADK_APP_PROXY_URL: ${ADK_APP_PROXY_URL:-}
+      ADK_APP_MANIFEST: ${ADK_APP_MANIFEST:-}
+    volumes:
+      - adk-data:/home/adk/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+      microscheduler:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health', timeout=4).raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '2.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  WORKSPACE APP — Portal-kit UI (chat, mail, calendar, files, agents)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  workspace-app:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-workspace:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-workspace
+    <<: *common
+    ports:
+      - "${WORKSPACE_PORT:-3000}:8000"
+    environment:
+      <<: *common-env
+      APP_ID: ${APP_ID:-${AITHER_IDENTITY:-workspace}}
+      APP_PORT: "8000"
+      LLM_PROVIDER: adk
+      DEPLOYMENT_MODE: sovereign
+      ADK_SERVER_URL: http://adk-server:8080
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      COLLECTION_NAME: ${AITHER_TENANT:-default}
+      AITHER_IDENTITY_URL: https://aitheros-security-core:8115
+      AITHER_DIRECTORY_URL: https://aitheros-directory:8214
+      AITHER_SECRETS_URL: https://aitheros-secrets:8111
+      AITHER_STRATA_URL: https://aitheros-strata:8136
+      AITHER_GRAPH_URL: http://graph:8154
+      # LLM routing — sovereign uses MicroScheduler for queuing/VRAM coordination
+      AITHEROS_URL: http://microscheduler:8150
+      AITHEROS_MODEL: ${AITHER_MODEL:-auto}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${AITHER_MODEL:-gemma4:4b}
+      EMBEDDING_PROVIDER: ollama
+      EMBEDDING_URL: http://ollama:11434
+      EMBEDDING_MODEL: nomic-embed-text
+      # App-specific brain pack (set by deploy sovereign --app)
+      AGENT_BRAIN_PACK: ${AGENT_BRAIN_PACK:-}
+    volumes:
+      - workspace-data:/app/data
+      - workspace-packs:/app/packs
+      - workspace-brand:/app/brand
+    depends_on:
+      adk-server:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  IDENTITY — the customer's own IdP (OIDC / OAuth / SAML / SCIM / device code)
+  #  SecurityCore compound (services.yaml: SecurityCore, port 8115). Identity is its
+  #  primary; routes answer at / and /identity. There is no separate identity image.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  identity:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-security-core:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-identity
+    <<: *common
+    ports:
+      - "${IDENTITY_PORT:-8115}:8115"
+    environment:
+      <<: [*common-env, *sovereign-idp-env, *sovereign-data-env]
+      AITHER_SERVICE: security_core
+      AITHER_MODULE: services.security.security_core
+      AITHERSECURITYCORE_PORT: "8115"
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (openssl rand -hex 32)}
+      AITHER_ADMIN_EMAIL: ${AITHER_ADMIN_EMAIL:-admin@localhost}
+      AITHER_ADMIN_PASSWORD: ${AITHER_ADMIN_PASSWORD:-}
+    volumes:
+      - identity-data:/data/identity
+      - secrets-data:/data/secrets:ro
+    networks:
+      default:
+        aliases: [aitheros-security-core, aitheros-securitycore, aitheros-identity]
+    depends_on:
+      secrets:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # A real Identity route: /health stays green even if Identity failed to mount.
+      test: ["CMD", "healthcheck.sh", "8115", "/identity/auth/methods"]
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  SECRETS — Credential vault (the customer's; backup/restore: SKILL sovereign-replica)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  secrets:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-security-core:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-secrets
+    <<: *common
+    ports:
+      - "${SECRETS_PORT:-8111}:8111"
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: secrets
+      AITHERSECRETS_PORT: "8111"
+      SECRETS_PATH: /data/secrets
+      AITHER_MASTER_KEY: ${AITHER_MASTER_KEY:?AITHER_MASTER_KEY must be set}
+      AITHER_KEY_SALT: ${AITHER_KEY_SALT:?AITHER_KEY_SALT must be set (openssl rand -hex 32)}
+      # Built-in OIDC client secrets are imported into THIS vault (*_CLIENT_SECRET).
+      # No defaults: a published default is a secret anyone can present.
+      OIDC_PORTAL_CLIENT_SECRET: ${OIDC_PORTAL_CLIENT_SECRET:-}
+      OIDC_VEIL_CLIENT_SECRET: ${OIDC_VEIL_CLIENT_SECRET:-}
+      OIDC_GRAFANA_CLIENT_SECRET: ${OIDC_GRAFANA_CLIENT_SECRET:-}
+      OIDC_DEVICE_LINK_CLIENT_SECRET: ${OIDC_DEVICE_LINK_CLIENT_SECRET:-}
+    volumes:
+      - secrets-data:/data/secrets
+    networks:
+      default:
+        aliases: [aitheros-secrets]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8111", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  DIRECTORY — users, groups, sessions (LDAP on 8389), Postgres-backed
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  directory:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-directory:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-directory
+    <<: *common
+    ports:
+      - "${DIRECTORY_PORT:-8214}:8214"
+    environment:
+      <<: [*common-env, *sovereign-data-env]
+      AITHER_SERVICE: Directory
+      AITHER_MODULE: services.infrastructure.AitherDirectory
+      AITHERDIRECTORY_PORT: "8214"
+      AITHER_BOOT_WATCHDOG_KILL: "true"
+    volumes:
+      - directory-data:/data
+    networks:
+      default:
+        aliases: [aitheros-directory]
+    depends_on:
+      secrets:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8214", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  STRATA — the customer's data plane (storage tiering, ingest, query; + Mint)
+  #  services.yaml: StrataData compound, port 8136. Same core image, own service.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # One-shot: a NEW named volume mounted where the image has no directory is
+  # created root-owned, and these services run as uid 1000. On the owner's fleet a
+  # host bind mount hides this; on a clean box it is EACCES at boot (measured
+  # 2026-11-06, EC2 Ubuntu 24.04: strata and microscheduler crash-looped).
+  volume-init:
+    image: busybox:1.36
+    container_name: sovereign-volume-init
+    user: "0"
+    command: ["sh", "-c", "mkdir -p /v/strata-bulk/cache && chown -R 1000:1000 /v/strata /v/strata-bulk /v/microscheduler /v/chronicle /v/flux /v/comet && echo volume-init ok"]
+    volumes:
+      - strata-data:/v/strata
+      - strata-bulk:/v/strata-bulk
+      - microscheduler-data:/v/microscheduler
+      - chronicle-data:/v/chronicle
+      - flux-data:/v/flux
+      - comet-data:/v/comet
+    restart: "no"
+
+  strata:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-security-core:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-strata
+    <<: *common
+    ports:
+      - "${STRATA_PORT:-8136}:8136"
+    environment:
+      <<: [*common-env, *sovereign-data-env]
+      AITHER_SERVICE: strata_data
+      AITHER_MODULE: services.infrastructure.strata_data
+      AITHERSTRATA_PORT: "8136"
+      AITHER_LOCAL_BACKUP_DIR: /data/backups
+      AITHER_STRATA_AUDIT_DB: /app/AitherOS/Library/Data/strata/audit.db
+      # Mesh self-service trust is a federation feature: off on a sovereign island.
+      AITHER_MESH_AUTO_TRUST_TIER1: "false"
+    volumes:
+      # The WHOLE Library/Data: Strata writes Data/strata (lowercase -- the old `Strata`
+      # mount missed it), Data/ide-sessions and more; anything left in the image layer
+      # is root-owned and Strata died EACCES on a clean box.
+      - strata-data:/app/AitherOS/Library/Data
+      # config/strata.yaml (baked, shared with the fleet) puts the cache tier at
+      # /mnt/strata-bulk/cache; without a volume there Strata exits at startup.
+      - strata-bulk:/mnt/strata-bulk
+      - strata-backups:/data/backups
+    networks:
+      default:
+        aliases: [aitheros-strata]
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+      secrets:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8136", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sovereign-postgres
+    <<: *common
+    environment:
+      POSTGRES_USER: aither
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: aither_admin
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases: [aitheros-postgres]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aither -d aither_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  MAIL — Email/notifications (IMAP/SMTP proxy)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  mail:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-communication-core:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-mail
+    networks:
+      default:
+        aliases: [aitheros-relay, aitheros-communication-core]
+    <<: *common
+    ports:
+      - "${MAIL_PORT:-8205}:8205"
+    environment:
+      <<: *common-env
+      # The compound: Relay (SNS/SQS row) is its PRIMARY router, Mail and SMTP ride
+      # along. `mail` alone shipped no messaging plane.
+      AITHER_SERVICE: communication_core
+      AITHER_MODULE: services.communication.communication_core
+      AITHERMAIL_PORT: "8205"
+      AITHER_MAIL_DOMAIN: ${AITHER_SOVEREIGN_DOMAIN}
+    volumes:
+      - mail-data:/data
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8205", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  AUDIT + EVENTS — Chronicle (CloudTrail row) and Flux (EventBridge row)
+  #  Only `latest` is published for these two (no `develop`), hence their own tags.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  chronicle:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-chronicle:${AITHEROS_CHRONICLE_TAG:-latest}
+    container_name: sovereign-chronicle
+    <<: *common
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: chronicle_log
+      AITHER_MODULE: services.infrastructure.chronicle_log
+    volumes:
+      - chronicle-data:/app/AitherOS/Library/Data
+    networks:
+      default:
+        aliases: [aitheros-chronicle]
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sfk --max-time 8 https://127.0.0.1:8121/health || curl -sf --max-time 2 http://127.0.0.1:8121/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  flux:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-flux:${AITHEROS_FLUX_TAG:-latest}
+    container_name: sovereign-flux
+    <<: *common
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: flux
+    volumes:
+      - flux-data:/app/AitherOS/Library/Data
+    networks:
+      default:
+        aliases: [aitheros-flux, aither-flux]
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8117", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  PROFILE: compute — OPT-IN AitherComet (EC2 / Batch row): provisions remote
+  #  nodes with the CUSTOMER's own provider keys. Opt-in because it mounts the
+  #  engine socket (root-equivalent on the host) and can spend money; every budget
+  #  defaults to 0 here, so nothing is rented until the customer sets one.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  comet:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-comet:${AITHEROS_COMET_TAG:-latest}
+    container_name: sovereign-comet
+    profiles: ["compute"]
+    <<: *common
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: comet
+      AITHER_MODULE: services.mesh.AitherComet
+      VAST_SERVERLESS_BUDGET_DAILY: ${VAST_SERVERLESS_BUDGET_DAILY:-0}
+      VAST_SERVERLESS_BUDGET_HOURLY: ${VAST_SERVERLESS_BUDGET_HOURLY:-0}
+    volumes:
+      - comet-data:/app/AitherOS/Library/Data
+      - ${AITHER_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    networks:
+      default:
+        aliases: [aitheros-comet]
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8125", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  GRAPH — AitherGraph intelligence graph
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  graph:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-aithergraph:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-graph
+    <<: *common
+    ports:
+      - "${GRAPH_PORT:-8154}:8154"
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: aithergraph
+      AITHERGRAPH_PORT: "8154"
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      - graph-data:/data
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "8154", "/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  SPIRIT — Persistent vector memory
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  spirit:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-intelligence:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-spirit
+    <<: *common
+    ports:
+      - "${SPIRIT_PORT:-8087}:8087"
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: spirit
+      AITHERSPIRIT_PORT: "8087"
+    volumes:
+      - spirit-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8087/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  MICROSCHEDULER — LLM queue, VRAM coordination, model routing
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  microscheduler:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-microscheduler:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-microscheduler
+    <<: *common
+    ports:
+      - "${MICROSCHEDULER_PORT:-8150}:8150"
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: microscheduler
+      AITHERMICROSCHEDULER_PORT: "8150"
+      AITHER_STANDALONE: "true"
+      # Backend configuration — routes to Ollama by default, vLLM when gpu profile active
+      OLLAMA_URL: http://ollama:11434
+      VLLM_URL: ${VLLM_URL:-}
+      AITHER_LLM_BACKEND: ${AITHER_LLM_BACKEND:-ollama}
+      AITHER_MODEL: ${AITHER_MODEL:-gemma4:4b}
+      # Pool settings for sovereign (smaller than platform)
+      LLM_POOL_SLOTS: ${LLM_POOL_SLOTS:-8}
+      LLM_POOL_TIMEOUT: "60"
+    volumes:
+      - microscheduler-data:/app/AitherOS/Library/Data
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8150/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 1G   # measured 255.5/256 MiB at idle on a clean box
+          cpus: '1.0'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INFRASTRUCTURE — Qdrant, Redis, Ollama
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sovereign-qdrant
+    <<: *common
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]  # no curl in the image
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  redis:
+    image: redis:7-alpine
+    container_name: sovereign-redis
+    <<: *common
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sovereign-ollama
+    <<: *common
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/11434' || exit 1"]  # no curl in the image
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  PROFILE: gpu — GPU-accelerated vLLM backend
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  vllm:
+    image: vllm/vllm-openai:${AITHER_VLLM_IMAGE_TAG:-latest}
+    container_name: sovereign-vllm
+    profiles: ["gpu"]
+    <<: *common
+    shm_size: '4gb'
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      VLLM_NO_USAGE_STATS: '1'
+      HF_TOKEN: ${HF_TOKEN:-}
+    command: >
+      --model ${AITHER_VLLM_MODEL:-nvidia/Nemotron-Orchestrator-8B}
+      --served-model-name aither-orchestrator
+      --gpu-memory-utilization ${AITHER_VLLM_GPU_UTIL:-0.35}
+      --max-model-len ${AITHER_VLLM_CTX_LEN:-16384}
+      --port 8120
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+      --enable-prefix-caching
+      --trust-remote-code
+      --dtype auto
+      --max-num-seqs 8
+    ports:
+      - "${VLLM_PORT:-8120}:8120"
+    volumes:
+      - vllm-cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8120/health"]
+      interval: 30s
+      timeout: 15s
+      start_period: 300s
+      retries: 10
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  PROFILE: tunnel — Cloudflare Tunnel for remote TLS access
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: sovereign-cloudflared
+    profiles: ["tunnel"]
+    <<: *common
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      workspace-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "info"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  PROFILE: backup — AitherRecover backup/restore service
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  recover:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-recover:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-recover
+    profiles: ["backup"]
+    <<: *common
+    ports:
+      - "${RECOVER_PORT:-8163}:8163"
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: recover
+      AITHERRECOVER_PORT: "8163"
+      AITHER_BACKUP_DIR: /backups
+      AITHER_MAX_BACKUPS: ${AITHER_MAX_BACKUPS:-10}
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      - backup-data:/backups
+      - workspace-data:/data/workspace:ro
+      - identity-data:/data/identity:ro
+      - secrets-data:/data/secrets:ro
+      - directory-data:/data/directory:ro
+      - strata-data:/data/strata:ro
+      - graph-data:/data/graph:ro
+      - spirit-data:/data/spirit:ro
+      - mail-data:/data/mail:ro
+      - adk-data:/data/adk:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8163/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  PROFILE: monitoring — Prometheus + Grafana health dashboard
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sovereign-prometheus
+    profiles: ["monitoring"]
+    <<: *common
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      # Relative paths resolve against THIS file's directory, not the repo root; the old
+      # ./AitherOS/... made Docker create an empty DIRECTORY and prometheus failed to start.
+      - ./sovereign-prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sovereign-grafana
+    profiles: ["monitoring"]
+    <<: *common
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      # Required, never a default: `aither` was a published admin password on every
+      # customer box. `aws init` generates it.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set (run aws init)}
+      # No plugin downloads at boot: on a clean box Grafana spent its start window
+      # updating bundled plugins and restart-looped (exit 0, 12 restarts, EC2 2026-11-06).
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  PROFILE: sync — OPT-IN platform sync daemon (updates, telemetry, license).
+  #  Off by default; requires AITHER_PLATFORM_URL. Not part of the sovereign island.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  sync:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aitheros-sync:${AITHEROS_IMAGE_TAG:-latest}
+    container_name: sovereign-sync
+    profiles: ["sync"]
+    <<: *common
+    ports:
+      - "${SYNC_PORT:-8190}:8190"
+    environment:
+      <<: *common-env
+      AITHER_SERVICE: sync
+      AITHERSYNC_PORT: "8190"
+      AITHER_API_KEY: ${AITHER_API_KEY:-}
+      # No default: a sovereign stack syncs with nobody until the operator names a
+      # hub. (The Aitherium hub is https://api.aitherium.com -- opt in explicitly.)
+      AITHER_PLATFORM_URL: ${AITHER_PLATFORM_URL:-}
+      AITHER_SYNC_INTERVAL: ${AITHER_SYNC_INTERVAL:-300}
+    volumes:
+      - sync-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8190/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Volumes
+# ═══════════════════════════════════════════════════════════════════════════
+volumes:
+  adk-data:
+  workspace-data:
+  identity-data:
+  secrets-data:
+  directory-data:
+  strata-data:
+  strata-backups:
+  microscheduler-data:
+  chronicle-data:
+  flux-data:
+  comet-data:
+  strata-bulk:
+  postgres-data:
+  mail-data:
+  graph-data:
+  spirit-data:
+  qdrant-data:
+  redis-data:
+  ollama-data:
+  vllm-cache:
+  sync-data:
+  workspace-packs:
+  workspace-brand:
+  backup-data:
+  prometheus-data:
+  grafana-data:
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Networks
+# ═══════════════════════════════════════════════════════════════════════════
+networks:
+  default:
+    name: sovereign-network
+    driver: bridge

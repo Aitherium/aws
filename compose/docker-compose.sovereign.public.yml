@@ -1,0 +1,31 @@
+# Aither World Services -- PUBLIC images. Layer on the sovereign compose:
+#   docker compose -f docker-compose.sovereign.yml -f docker-compose.sovereign.public.yml ...
+# `aws init --public` / `aws up --apply` do this. Each aws-* image is a single-layer slim
+# copy scanned layer by layer before it is published. No registry login needed.
+services:
+  adk-server:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-adk-server:${AWS_PUBLIC_TAG:-v0.1.0}
+  chronicle:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-chronicle:${AWS_PUBLIC_TAG:-v0.1.0}
+  comet:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-comet:${AWS_PUBLIC_TAG:-v0.1.0}
+  directory:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-directory:${AWS_PUBLIC_TAG:-v0.1.0}
+  flux:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-flux:${AWS_PUBLIC_TAG:-v0.1.0}
+  graph:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-aithergraph:${AWS_PUBLIC_TAG:-v0.1.0}
+  identity:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-security-core:${AWS_PUBLIC_TAG:-v0.1.0}
+  mail:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-communication-core:${AWS_PUBLIC_TAG:-v0.1.0}
+  microscheduler:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-microscheduler:${AWS_PUBLIC_TAG:-v0.1.0}
+  secrets:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-security-core:${AWS_PUBLIC_TAG:-v0.1.0}
+  spirit:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-intelligence:${AWS_PUBLIC_TAG:-v0.1.0}
+  strata:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-security-core:${AWS_PUBLIC_TAG:-v0.1.0}
+  workspace-app:
+    image: ${AITHEROS_REGISTRY:-ghcr.io/aitherium}/aws-workspace:${AWS_PUBLIC_TAG:-v0.1.0}
