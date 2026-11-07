@@ -353,9 +353,20 @@ def cmd_up(apply: bool) -> int:
     argv += ["up", "-d", "--no-build", "--wait", "--wait-timeout", "900"]
     rc, out = _run(argv, timeout=2400)
     _out(out.strip()[-2000:])
-    if rc != 0:
-        _out(f"compose up exited {rc}")
-        return 1
+    if rc == 0:
+        return cmd_status("sovereign")
+    # `compose --wait` fails the moment one container is unhealthy, including a service
+    # that restarts ONCE on first boot while a peer (Secrets) is still coming up --
+    # measured on a clean box: directory restarted once, then went healthy 60 s later.
+    # The verdict is the stack's settled state, so re-judge for up to 10 minutes.
+    _out(f"compose up exited {rc}; re-checking the stack as it settles (up to 10 min)")
+    import time
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        rows, _err = list_containers()
+        if rows is not None and judge(rows, "sovereign")[0] == 0:
+            return cmd_status("sovereign")
+        time.sleep(20)
     return cmd_status("sovereign")
 
 
