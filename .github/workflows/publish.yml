@@ -1,0 +1,91 @@
+name: publish
+
+# Builds the public Aither World Services images (ghcr.io/aitherium/aws-*) and pushes them.
+#
+# A GHCR package takes its visibility from where it is CREATED and cannot be changed by
+# API afterwards. A package created by a workflow in this PUBLIC repo is created public and
+# linked here, so every release is public with no manual step.
+#
+# Each image is a single-layer copy of an AitherOS service image with an excluded path set
+# removed, then scanned layer by layer; a scan that is not exit 0 fails the job and that
+# image is never pushed. The exclusion set is a repository SECRET (EXCLUDE_RE), never a file.
+#
+# ubuntu-latest: the org's self-hosted runner groups refuse public repositories.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag for every aws-* image"
+        required: true
+        default: "v0.1.0"
+      only:
+        description: "Comma-separated short names; empty = all"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: "aws-${{ matrix.short }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - { short: security-core, src: "aitheros-security-core:latest", slim: true }
+          - { short: directory, src: "aitheros-directory:develop", slim: true }
+          - { short: communication-core, src: "aitheros-communication-core:develop", slim: true }
+          - { short: aithergraph, src: "aitheros-aithergraph:develop", slim: true }
+          - { short: intelligence, src: "aitheros-intelligence:develop", slim: true }
+          - { short: microscheduler, src: "aitheros-microscheduler:develop", slim: true }
+          - { short: chronicle, src: "aitheros-chronicle:latest", slim: true }
+          - { short: flux, src: "aitheros-flux:latest", slim: true }
+          - { short: comet, src: "aitheros-comet:latest", slim: true }
+          - { short: workspace, src: "aitheros-workspace:develop", slim: false }
+          - { short: adk-server, src: "adk-server:develop", slim: false }
+    env:
+      SRC: ghcr.io/aitherium/${{ matrix.src }}
+      DST: ghcr.io/aitherium/aws-${{ matrix.short }}:${{ inputs.tag }}
+      EXCLUDE_RE: ${{ secrets.EXCLUDE_RE }}
+    steps:
+      - name: Selected?
+        id: sel
+        run: |
+          case ",${{ inputs.only }}," in
+            ",,"|*",${{ matrix.short }},"*) echo "go=1" >> "$GITHUB_OUTPUT" ;;
+            *) echo "go=0" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: actions/checkout@v4
+        if: steps.sel.outputs.go == '1'
+      - name: Free runner disk
+        if: steps.sel.outputs.go == '1'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Pull the source image (private AitherOS registry)
+        if: steps.sel.outputs.go == '1'
+        run: echo "${{ secrets.SOURCE_PULL_TOKEN }}" | sudo podman login ghcr.io -u aitherium --password-stdin
+      - name: Build
+        if: steps.sel.outputs.go == '1'
+        run: |
+          if [ "${{ matrix.slim }}" = "true" ]; then
+            sudo -E sh aws-public-slim.sh "$SRC" "$DST"
+          else
+            sudo podman pull -q "$SRC" && sudo podman tag "$SRC" "$DST"
+          fi
+      - name: Scan every layer before any push
+        if: steps.sel.outputs.go == '1'
+        run: sudo -E python3 scan_layers.py "$DST"
+      - name: Push (as this repo, so the package is created public)
+        if: steps.sel.outputs.go == '1'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          sudo podman push "$DST"
